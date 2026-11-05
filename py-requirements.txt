@@ -1,0 +1,7 @@
+numpy<2.3
+Pillow==12.2.0
+opencv-python-headless
+mido==1.3.3
+pyloudnorm==0.1.1
+scipy
+requests
