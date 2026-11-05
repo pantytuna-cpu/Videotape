@@ -1,0 +1,84 @@
+# 범용 Python/블렌더 작업 워커(2026-11-04, 썰툰 Modal 대체). 로컬 gha_job.py가 code·자산·작업 폴더 + jobs/<n>.json을 암호화해 올린다.
+# part = {index}: jobs/<index>.json = {cwd, cmd:[...], env:{...}, outputs:[glob...]} 를 실행하고 outputs를 tar로 묶어 암호화 아티팩트로 돌려준다.
+# blender 입력이 있으면 블렌더(리눅스판)와 Mesa(소프트웨어 GL)를 설치한다(GPU 없음 — EEVEE 약 26초/프레임).
+name: py-job
+run-name: py-job ${{ inputs.job }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job: {description: job id, required: true, type: string}
+      asset_id: {description: encrypted job tar release asset id, required: true, type: string}
+      parts: {description: JSON array of parts, required: true, type: string}
+      blender: {description: blender version or empty, required: false, type: string, default: ""}
+      whisper: {description: "1 to cache faster-whisper models", required: false, type: string, default: ""}
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        part: ${{ fromJSON(inputs.parts) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12", cache: pip, cache-dependency-path: "py-requirements*.txt"}
+      - name: System packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ffmpeg fluidsynth fluid-soundfont-gm fonts-noto-cjk >/dev/null
+          pip install -q -r py-requirements.txt
+          if [ -n "${{ inputs.whisper }}" ]; then pip install -q -r py-requirements-whisper.txt; fi
+      - uses: actions/cache@v4
+        if: inputs.whisper != ''
+        with:
+          path: ~/.cache/huggingface
+          key: whisper-large-v3-v1
+      - uses: actions/cache@v4
+        if: inputs.blender != ''
+        with:
+          path: ~/blender
+          key: blender-${{ inputs.blender }}-linux-x64-v1
+      - name: Blender and Mesa
+        if: inputs.blender != ''
+        env:
+          BLENDER_VERSION: ${{ inputs.blender }}
+        run: |
+          sudo apt-get install -y -qq --no-install-recommends libegl1 libgl1 libgl1-mesa-dri libegl-mesa0 libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 libsm6 libice6 xvfb bc >/dev/null
+          if [ ! -x ~/blender/blender ]; then
+            MAJOR=$(echo "$BLENDER_VERSION" | cut -d. -f1,2)
+            curl -fsSL "https://download.blender.org/release/Blender$MAJOR/blender-$BLENDER_VERSION-linux-x64.tar.xz" -o /tmp/b.tar.xz
+            mkdir -p ~/blender && tar -xf /tmp/b.tar.xz -C ~/blender --strip-components=1 && rm /tmp/b.tar.xz
+          fi
+          echo "BLENDER=$HOME/blender/blender" >> "$GITHUB_ENV"
+      - name: Fetch input
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RENDER_KEY: ${{ secrets.RENDER_KEY }}
+          ASSET_ID: ${{ matrix.part.asset_id || inputs.asset_id }}  # part마다 자기 입력이 있으면 그것만 받는다
+        run: |
+          curl -fsSL --retry 3 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" \
+            -o "$RUNNER_TEMP/in.enc" "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/assets/$ASSET_ID"
+          node crypt.cjs dec "$RUNNER_TEMP/in.enc" "$RUNNER_TEMP/in.tar"
+          mkdir -p "$RUNNER_TEMP/job" && tar -xf "$RUNNER_TEMP/in.tar" -C "$RUNNER_TEMP/job"
+          rm -f "$RUNNER_TEMP/in.enc" "$RUNNER_TEMP/in.tar"
+      - name: Run
+        env:
+          PART: ${{ toJSON(matrix.part) }}
+          RENDER_KEY: ${{ secrets.RENDER_KEY }}
+        run: python py-job-run.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ inputs.job }}-part-${{ matrix.part.index }}
+          path: ${{ runner.temp }}/out/*.enc
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: warn
