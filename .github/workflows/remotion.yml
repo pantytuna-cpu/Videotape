@@ -1,0 +1,68 @@
+# 낮밤 포맷 쇼츠 Remotion 구간 렌더 워커. 로컬 gha-render.mjs가 암호화 번들을 초안 릴리스 자산으로 올리고 이 워크플로를 호출한다.
+# 구간(part)마다 러너 1대, 결과는 암호화한 채 아티팩트(보관 1일)로 돌려준다. 이어붙이기·mux·검증은 로컬이 한다.
+name: remotion
+run-name: remotion ${{ inputs.job }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job: {description: job id, required: true, type: string}
+      asset_id: {description: encrypted bundle release asset id, required: true, type: string}
+      parts: {description: JSON array of parts, required: true, type: string}
+      remotion: {description: remotion version, required: true, type: string}
+
+permissions:
+  contents: write  # 초안 릴리스 자산은 쓰기 권한이 있어야 보인다
+  actions: read
+
+jobs:
+  render:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        part: ${{ fromJSON(inputs.parts) }}
+    env:
+      REMOTION_VERSION: ${{ inputs.remotion }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: 22}
+      - uses: actions/cache@v4
+        with:
+          path: ~/r/node_modules
+          key: remotion-${{ inputs.remotion }}-${{ runner.os }}-v1
+      - name: Install renderer
+        run: |
+          sudo apt-get install -y -qq --no-install-recommends fonts-noto-color-emoji >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends fonts-noto-color-emoji)
+          mkdir -p ~/r && cd ~/r
+          [ -f package.json ] || npm init -y >/dev/null
+          [ -d node_modules/@remotion/renderer ] || npm i --no-audit --no-fund "@remotion/renderer@$REMOTION_VERSION" "remotion@$REMOTION_VERSION"
+          node -e "require('@remotion/renderer').ensureBrowser().then(()=>console.log('browser ok'))"
+          cp "$GITHUB_WORKSPACE/remotion-render.cjs" "$GITHUB_WORKSPACE/crypt.cjs" ~/r/
+      - name: Fetch bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RENDER_KEY: ${{ secrets.RENDER_KEY }}
+          ASSET_ID: ${{ inputs.asset_id }}
+        run: |
+          curl -fsSL --retry 3 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" \
+            -o "$RUNNER_TEMP/bundle.enc" "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/assets/$ASSET_ID"
+          node crypt.cjs dec "$RUNNER_TEMP/bundle.enc" "$RUNNER_TEMP/bundle.tar"
+          mkdir -p "$RUNNER_TEMP/job" && tar -xf "$RUNNER_TEMP/bundle.tar" -C "$RUNNER_TEMP/job"
+          rm -f "$RUNNER_TEMP/bundle.enc" "$RUNNER_TEMP/bundle.tar"
+      - name: Render
+        working-directory: /home/runner/r
+        env:
+          PART: ${{ toJSON(matrix.part) }}
+          RENDER_KEY: ${{ secrets.RENDER_KEY }}
+        run: JOB_DIR="$RUNNER_TEMP/job" OUT_DIR="$RUNNER_TEMP/out" node remotion-render.cjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.job }}-part-${{ matrix.part.index }}
+          path: ${{ runner.temp }}/out/*.enc
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
