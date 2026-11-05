@@ -1,0 +1,68 @@
+# 실측 전용: GPU 없는 러너에서 블렌더 EEVEE Next가 소프트웨어 렌더(Mesa llvmpipe·lavapipe)로 얼마나 걸리는지 잰다(2026-11-04).
+# part = {index, backend: opengl|vulkan, start, end}. 결과 프레임과 시간 기록은 암호화 아티팩트로 돌려준다.
+name: blender-probe
+run-name: blender-probe ${{ inputs.job }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job: {description: job id, required: true, type: string}
+      asset_id: {description: encrypted input release asset id, required: true, type: string}
+      parts: {description: JSON array of parts, required: true, type: string}
+      blender: {description: blender version, required: true, type: string, default: "4.5.15"}
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  render:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        part: ${{ fromJSON(inputs.parts) }}
+    env:
+      BLENDER_VERSION: ${{ inputs.blender }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: ~/blender
+          key: blender-${{ inputs.blender }}-linux-x64-v1
+      - name: Install blender and Mesa
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends libegl1 libgl1 libgl1-mesa-dri libegl-mesa0 mesa-vulkan-drivers libvulkan1 \
+            libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 libsm6 libice6 xvfb >/dev/null
+          if [ ! -x ~/blender/blender ]; then
+            MAJOR=$(echo "$BLENDER_VERSION" | cut -d. -f1,2)
+            curl -fsSL "https://download.blender.org/release/Blender$MAJOR/blender-$BLENDER_VERSION-linux-x64.tar.xz" -o /tmp/b.tar.xz
+            mkdir -p ~/blender && tar -xf /tmp/b.tar.xz -C ~/blender --strip-components=1 && rm /tmp/b.tar.xz
+          fi
+          ~/blender/blender --version | head -1
+      - name: Fetch input
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RENDER_KEY: ${{ secrets.RENDER_KEY }}
+          ASSET_ID: ${{ inputs.asset_id }}
+        run: |
+          curl -fsSL --retry 3 -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/octet-stream" \
+            -o "$RUNNER_TEMP/in.enc" "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/assets/$ASSET_ID"
+          node crypt.cjs dec "$RUNNER_TEMP/in.enc" "$RUNNER_TEMP/in.tar"
+          mkdir -p "$RUNNER_TEMP/job" && tar -xf "$RUNNER_TEMP/in.tar" -C "$RUNNER_TEMP/job"
+      - name: Render
+        env:
+          PART: ${{ toJSON(matrix.part) }}
+          RENDER_KEY: ${{ secrets.RENDER_KEY }}
+        run: bash blender-probe.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ inputs.job }}-part-${{ matrix.part.index }}
+          path: ${{ runner.temp }}/out/*.enc
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: warn
